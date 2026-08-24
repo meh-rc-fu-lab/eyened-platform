@@ -13,13 +13,10 @@ from fastapi import (
     Response,
     UploadFile,
 )
-from sqlalchemy.orm import Session
 
-from ..db import get_db
 from ..dtos.dto_converter import DTOConverter
 from ..dtos.dtos_aux import ObjectTagPOST, TagMeta
 from ..dtos.dtos_main import SegmentationGET, SegmentationPATCH, SegmentationPOST
-from ..services.acting_user import ActingUser
 from ..services.segmentation_service import (
     ModelSegmentationService,
     SegmentationService,
@@ -66,14 +63,12 @@ def _segmentation_data_response(arr: Optional[np.ndarray], filename: str) -> Res
 async def create_segmentation(
     metadata: Annotated[str, Form()],
     np_array: Optional[UploadFile] = File(None),
-    db: Session = Depends(get_db),
     service: SegmentationService = Depends(get_segmentation_service),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     dto = SegmentationPOST.model_validate_json(metadata)
     array = await load_array(np_array)
     segmentation = service.create(
-        db,
         image_id=dto.image_id,
         feature_id=dto.feature_id,
         subtask_id=dto.subtask_id,
@@ -88,7 +83,6 @@ async def create_segmentation(
         threshold=dto.threshold,
         reference_segmentation_id=dto.reference_segmentation_id,
         array=array,
-        actor=ActingUser(id=current_user.id, username=current_user.username),
     )
     return DTOConverter.segmentation_to_get(segmentation)
 
@@ -96,25 +90,21 @@ async def create_segmentation(
 @router.get("/segmentations/{segmentation_id}", response_model=SegmentationGET)
 async def get_segmentation(
     segmentation_id: int,
-    db: Session = Depends(get_db),
     service: SegmentationService = Depends(get_segmentation_service),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    item = service.get_segmentation(db, segmentation_id)
+    item = service.get_segmentation(segmentation_id)
     return DTOConverter.segmentation_to_get(item)
 
 
 @router.delete("/segmentations/{segmentation_id}", status_code=204)
 async def delete_segmentation(
     segmentation_id: int,
-    db: Session = Depends(get_db),
     service: SegmentationService = Depends(get_segmentation_service),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     service.soft_delete(
-        db,
         segmentation_id,
-        ActingUser(id=current_user.id, username=current_user.username),
     )
     return Response(status_code=204)
 
@@ -125,7 +115,6 @@ async def update_segmentation_data(
     request: Request,
     axis: Optional[int] = None,
     scan_nr: Optional[int] = None,
-    db: Session = Depends(get_db),
     service: SegmentationService = Depends(get_segmentation_service),
     current_user: CurrentUser = Depends(get_current_user),
 ):
@@ -136,12 +125,10 @@ async def update_segmentation_data(
         )
     np_image = np.load(io.BytesIO(await request.body()))
     return service.write_data(
-        db,
         segmentation_id,
         np_image,
         axis=axis,
         scan_nr=scan_nr,
-        actor=ActingUser(id=current_user.id, username=current_user.username),
     )
 
 
@@ -150,11 +137,10 @@ async def get_segmentation_data(
     segmentation_id: int,
     axis: Optional[int] = None,
     scan_nr: Optional[int] = None,
-    db: Session = Depends(get_db),
     service: SegmentationService = Depends(get_segmentation_service),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    arr = service.read_data(db, segmentation_id, axis=axis, scan_nr=scan_nr)
+    arr = service.read_data(segmentation_id, axis=axis, scan_nr=scan_nr)
     return _segmentation_data_response(arr, "segmentation.npy.gz")
 
 
@@ -162,17 +148,14 @@ async def get_segmentation_data(
 async def patch_segmentation(
     segmentation_id: int,
     dto: SegmentationPATCH,
-    db: Session = Depends(get_db),
     service: SegmentationService = Depends(get_segmentation_service),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     segmentation = service.patch(
-        db,
         segmentation_id,
         reference_segmentation_id=dto.reference_segmentation_id,
         feature_id=dto.feature_id,
         threshold=dto.threshold,
-        actor=ActingUser(id=current_user.id, username=current_user.username),
     )
     return DTOConverter.segmentation_to_get(segmentation)
 
@@ -181,16 +164,13 @@ async def patch_segmentation(
 async def tag_segmentation(
     segmentation_id: int,
     body: ObjectTagPOST,
-    db: Session = Depends(get_db),
     service: SegmentationService = Depends(get_segmentation_service),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> TagMeta:
     """Attach a Tag to a Segmentation by tag ID (idempotent)."""
     link = service.tag(
-        db,
         segmentation_id,
         body.tag_id,
-        ActingUser(id=current_user.id, username=current_user.username),
     )
     return DTOConverter.link_to_tag_metadata(link)
 
@@ -199,16 +179,13 @@ async def tag_segmentation(
 async def untag_segmentation(
     segmentation_id: int,
     tag_id: int,
-    db: Session = Depends(get_db),
     service: SegmentationService = Depends(get_segmentation_service),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """Remove a Tag from a Segmentation (idempotent)."""
     service.untag(
-        db,
         segmentation_id,
         tag_id,
-        ActingUser(id=current_user.id, username=current_user.username),
     )
     return Response(status_code=204)
 
@@ -218,11 +195,10 @@ async def get_model_segmentation_data(
     model_segmentation_id: int,
     axis: Optional[int] = None,
     scan_nr: Optional[int] = None,
-    db: Session = Depends(get_db),
     service: ModelSegmentationService = Depends(get_model_segmentation_service),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    arr = service.read_data(db, model_segmentation_id, axis=axis, scan_nr=scan_nr)
+    arr = service.read_data(model_segmentation_id, axis=axis, scan_nr=scan_nr)
     return _segmentation_data_response(arr, "model_segmentation.npy.gz")
 
 
@@ -232,7 +208,6 @@ async def update_model_segmentation_data(
     request: Request,
     axis: Optional[int] = None,
     scan_nr: Optional[int] = None,
-    db: Session = Depends(get_db),
     service: ModelSegmentationService = Depends(get_model_segmentation_service),
     current_user: CurrentUser = Depends(get_current_user),
 ):
@@ -243,5 +218,5 @@ async def update_model_segmentation_data(
         )
     np_image = np.load(io.BytesIO(await request.body()))
     return service.write_data(
-        db, model_segmentation_id, np_image, axis=axis, scan_nr=scan_nr
+        model_segmentation_id, np_image, axis=axis, scan_nr=scan_nr
     )

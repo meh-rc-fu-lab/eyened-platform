@@ -15,6 +15,7 @@ from eyened_orm import (
 from eyened_orm.project import ExternalEnum
 from eyened_orm.segmentation import DataRepresentation, Datatype
 from eyened_orm.repositories.segmentation_repository import SegmentationRepository
+from eyened_orm.utils.factories import admin_scope
 
 
 def _make_segmentation(
@@ -85,10 +86,10 @@ def _make_segmentation(
 def test_get_with_tag_links_found_and_missing(session):
     """get_with_tag_links returns the row (tag links eager-loaded) or None."""
     seg = _make_segmentation(session, "one")
-    repo = SegmentationRepository()
+    repo = SegmentationRepository(session, scope=admin_scope())
 
-    got = repo.get_with_tag_links(session, seg.SegmentationID)
+    got = repo.get_with_tag_links(seg.SegmentationID)
     assert got is not None and got.SegmentationID == seg.SegmentationID
     assert list(got.SegmentationTagLinks) == []  # eager-loaded, empty
 
-    assert repo.get_with_tag_links(session, 999_999) is None
+    assert repo.get_with_tag_links(999_999) is None

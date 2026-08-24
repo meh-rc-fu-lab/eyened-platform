@@ -3,14 +3,20 @@ from __future__ import annotations
 from sqlalchemy.orm import Session, selectinload
 
 from eyened_orm import AttributeValue, Patient
+from eyened_orm.authz.scope import AccessScope
+
+from ._scoped import scoped_one
 
 
 class PatientRepository:
     """Data access for Patient rows."""
 
+    def __init__(self, session: Session, *, scope: AccessScope) -> None:
+        self._session = session
+        self._scope = scope
+
     def get_with_attributes(
         self,
-        session: Session,
         patient_id: int,
         include_attributes: bool = True,
     ) -> Patient | None:
@@ -29,4 +35,10 @@ class PatientRepository:
                     AttributeValue.ProducingModel
                 )
             )
-        return session.get(Patient, patient_id, options=tuple(opts))
+        return scoped_one(
+            self._session,
+            Patient,
+            self._scope,
+            Patient.PatientID == patient_id,
+            options=tuple(opts),
+        )

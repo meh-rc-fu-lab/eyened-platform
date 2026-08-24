@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 import numpy as np
+from fastapi import Depends
 from sqlalchemy.orm import Session
 
 from eyened_orm import ImageInstance, ModelSegmentation, Segmentation
@@ -17,9 +18,14 @@ from eyened_orm.repositories.segmentation_repository import (
     SegmentationRepository,
 )
 from eyened_orm.repositories.tag_repository import TagRepository
+from eyened_orm.authz.ownership import require_owner, require_owner_or_project_admin
+from eyened_orm.authz.roles import ProjectRole
+from eyened_orm.authz.scope import AccessScope
 
-from ..utils.db_logging import DatabaseModificationLogger, get_db_logger
+from ..db import get_db
+from .access_scope import get_access_scope
 from .acting_user import ActingUser
+from .audit_service import AuditService, get_audit_service
 from .exceptions import BadRequestError, NotFoundError
 from .segmentation_data_store import (
     SegmentationDataStore,
@@ -28,7 +34,14 @@ from .segmentation_data_store import (
 
 
 class SegmentationService:
-    """Business logic for Segmentation CRUD, binary data, and Tag links."""
+    """Business logic for Segmentation CRUD, binary data, and Tag links.
+
+    Coordinates with an injected ``SegmentationDataStore`` (zarr). Zarr writes
+    are NOT part of the DB transaction — store/DB cross-atomicity remains out
+    of scope for this refactor (tracked separately: zarr-concurrency /
+    segmentation storage-port work). Each site below preserves the exact
+    pre-refactor ordering of the store write relative to the DB flush.
+    """
 
     def __init__(
         self,
@@ -36,30 +49,57 @@ class SegmentationService:
         image_repository: ImageInstanceRepository,
         tag_repository: TagRepository,
         data_store: SegmentationDataStore,
-        logger: DatabaseModificationLogger | None = None,
+        *,
+        scope: AccessScope,
+        audit: AuditService | None = None,
     ) -> None:
         self.repository = repository
         self.images = image_repository
         self.tags = tag_repository
         self.store = data_store
-        self.logger = logger
+        self.scope = scope
+        self._actor = ActingUser.from_scope(scope)
+        self.audit = audit
 
-    def get_segmentation(
-        self, session: Session, segmentation_id: int
-    ) -> Segmentation:
+    def _require_reachable_references(
+        self,
+        *,
+        subtask_id: int | None = None,
+        reference_segmentation_id: int | None = None,
+    ) -> None:
+        """Refuse an id the caller cannot reach, before it is written.
+
+        ``None`` passes through -- it is a legitimate value, not an omission.
+        Each id is resolved through a **scoped** lookup, mirroring what
+        ``image_id`` already does on this same create path: an id outside the
+        caller's reach comes back as ``None`` and is answered exactly as a
+        non-existent one is.
+
+        Not a consistency guard: nothing here asks whether the subtask holds
+        this image, or whether the reference is of the same feature. Those
+        questions were deliberately left open.
+        """
+        if subtask_id is not None and self.repository.get_subtask(subtask_id) is None:
+            raise NotFoundError("SubTask not found")
+        if (
+            reference_segmentation_id is not None
+            and self.repository.get_by_id(reference_segmentation_id) is None
+        ):
+            raise NotFoundError("Referenced Segmentation not found")
+
+    def get_segmentation(self, segmentation_id: int) -> Segmentation:
         """Return a segmentation by id (tag links loaded).
 
         Raises:
             NotFoundError: If the segmentation does not exist.
         """
-        item = self.repository.get_with_tag_links(session, segmentation_id)
+        item = self.repository.get_with_tag_links(segmentation_id)
         if item is None:
             raise NotFoundError("Segmentation not found")
         return item
 
     def read_data(
         self,
-        session: Session,
         segmentation_id: int,
         *,
         axis: Optional[int] = None,
@@ -71,7 +111,7 @@ class SegmentationService:
             NotFoundError: If the segmentation does not exist.
             BadRequestError: If the store rejects the read parameters.
         """
-        segmentation = self.repository.get_by_id(session, segmentation_id)
+        segmentation = self.repository.get_by_id(segmentation_id)
         if segmentation is None:
             raise NotFoundError("Segmentation data not found")
         try:
@@ -81,7 +121,6 @@ class SegmentationService:
 
     def create(
         self,
-        session: Session,
         *,
         image_id: str,
         feature_id: int,
@@ -97,7 +136,6 @@ class SegmentationService:
         threshold: float | None,
         reference_segmentation_id: int | None,
         array: np.ndarray | None,
-        actor: ActingUser,
     ) -> Segmentation:
         """Create a Segmentation and write its (empty or provided) data.
 
@@ -106,14 +144,28 @@ class SegmentationService:
             BadRequestError: If the array/shape is inconsistent or the store
                 rejects the write.
         """
-        instance = self.images.get_by_public_id(session, image_id)
+        instance = self.images.get_by_public_id(image_id)
         if instance is None:
             raise NotFoundError("ImageInstance not found")
+        self._require_reachable_references(
+            subtask_id=subtask_id,
+            reference_segmentation_id=reference_segmentation_id,
+        )
+        # No ownership overlay on create: the row does not exist yet and its
+        # author is the caller by construction (CreatorID below). The floor is
+        # judged on the image's project, which is the only project the new
+        # segmentation can ever touch.
+        self.scope.require(
+            self.images.project_ids(instance.ImageInstanceID),
+            ProjectRole.grader,
+            entity="Segmentation",
+            entity_id=None,
+        )
 
         segmentation = Segmentation(
             ImageInstanceID=instance.ImageInstanceID,
             FeatureID=feature_id,
-            CreatorID=actor.id,
+            CreatorID=self.scope.actor_id,
             SubTaskID=subtask_id,
             DataType=data_type,
             DataRepresentation=data_representation,
@@ -129,29 +181,28 @@ class SegmentationService:
         )
         data = self._assemble_data(segmentation, instance, array)
 
-        session.add(segmentation)
-        session.flush()
+        # add+flush assigns the PK; the store write below MUST stay after it
+        # (the store keys writes by SegmentationID). Zarr I/O is not part of
+        # the DB transaction — see the class-level note on atomicity.
+        self.repository.add(segmentation)
         try:
             self.store.write(segmentation, data)
         except ValueError as e:
             raise BadRequestError(str(e)) from e
-        session.commit()
-        session.refresh(segmentation)
 
-        if self.logger is not None:
-            self.logger.log_insert(
-                user=actor.username,
-                user_id=actor.id,
-                endpoint="POST /api/segmentations",
+        if self.audit is not None:
+            self.audit.record(
+                action="INSERT",
                 entity="Segmentation",
+                actor=self._actor,
                 entity_id=segmentation.SegmentationID,
-                fields={
+                changes={
                     "image_instance_id": segmentation.ImageInstanceID,
                     "feature_id": segmentation.FeatureID,
                     "subtask_id": segmentation.SubTaskID,
                     "creator_id": segmentation.CreatorID,
-                    "data_type": str(segmentation.DataType),
-                    "data_representation": str(segmentation.DataRepresentation),
+                    "data_type": segmentation.DataType,
+                    "data_representation": segmentation.DataRepresentation,
                     "shape": segmentation.shape,
                     "sparse_axis": segmentation.SparseAxis,
                     "threshold": segmentation.Threshold,
@@ -221,13 +272,11 @@ class SegmentationService:
 
     def write_data(
         self,
-        session: Session,
         segmentation_id: int,
         data: np.ndarray,
         *,
         axis: Optional[int] = None,
         scan_nr: Optional[int] = None,
-        actor: ActingUser,
     ) -> Segmentation:
         """Write (a slice of) a segmentation's binary data via the store.
 
@@ -235,116 +284,150 @@ class SegmentationService:
             NotFoundError: If the segmentation does not exist.
             BadRequestError: If the store rejects the write.
         """
-        segmentation = self.repository.get_by_id(session, segmentation_id)
+        segmentation = self.repository.get_by_id(segmentation_id)
         if segmentation is None:
             raise NotFoundError("Segmentation data not found")
+        projects = self.repository.project_ids(segmentation_id)
+        self.scope.require(
+            projects,
+            ProjectRole.grader,
+            entity="Segmentation",
+            entity_id=segmentation_id,
+        )
+        require_owner(
+            self.scope,
+            owner_id=segmentation.CreatorID,
+            entity="Segmentation",
+            entity_id=segmentation_id,
+            projects=projects,
+        )
+        # Store write MUST stay before the repo write here (unchanged order
+        # from pre-refactor: store.write -> session.add). Zarr I/O is not
+        # part of the DB transaction — see the class-level note on atomicity.
         try:
             self.store.write(
                 segmentation, data, axis=axis, slice_index=scan_nr
             )
         except (IndexError, ValueError) as e:
             raise BadRequestError(str(e)) from e
-        session.add(segmentation)
-        session.commit()
-        session.refresh(segmentation)
-        if self.logger is not None:
-            self.logger.log_simple(
-                user=actor.username,
-                user_id=actor.id,
-                endpoint=f"PUT /api/segmentations/{segmentation_id}/data",
-                operation="UPDATE",
+        self.repository.save(segmentation)
+        if self.audit is not None:
+            # Pre-refactor log_simple carried no fields/changes (high-frequency
+            # op, deliberately lightweight) — preserved as-is.
+            self.audit.record(
+                action="UPDATE",
                 entity="Segmentation",
+                actor=self._actor,
                 entity_id=segmentation_id,
             )
         return segmentation
 
-    def soft_delete(
-        self, session: Session, segmentation_id: int, actor: ActingUser
-    ) -> None:
+    def soft_delete(self, segmentation_id: int) -> None:
         """Soft-delete a segmentation (sets Inactive; row is kept).
 
         Raises:
             NotFoundError: If the segmentation does not exist.
         """
-        segmentation = self.repository.get_by_id(session, segmentation_id)
+        segmentation = self.repository.get_by_id(segmentation_id)
         if segmentation is None:
             raise NotFoundError("Segmentation not found")
+        projects = self.repository.project_ids(segmentation_id)
+        self.scope.require(
+            projects,
+            ProjectRole.grader,
+            entity="Segmentation",
+            entity_id=segmentation_id,
+        )
+        require_owner_or_project_admin(
+            self.scope,
+            owner_id=segmentation.CreatorID,
+            entity="Segmentation",
+            entity_id=segmentation_id,
+            projects=projects,
+        )
 
         deleted_data = {
             "image_instance_id": segmentation.ImageInstanceID,
             "feature_id": segmentation.FeatureID,
             "subtask_id": segmentation.SubTaskID,
             "creator_id": segmentation.CreatorID,
-            "data_type": str(segmentation.DataType),
-            "data_representation": str(segmentation.DataRepresentation),
+            "data_type": segmentation.DataType,
+            "data_representation": segmentation.DataRepresentation,
             "shape": segmentation.shape,
             "sparse_axis": segmentation.SparseAxis,
             "threshold": segmentation.Threshold,
             "reference_segmentation_id": segmentation.ReferenceSegmentationID,
         }
         segmentation.Inactive = True
-        session.commit()
-        if self.logger is not None:
-            self.logger.log_delete(
-                user=actor.username,
-                user_id=actor.id,
-                endpoint=f"DELETE /api/segmentations/{segmentation_id}",
+        self.repository.save(segmentation)
+        if self.audit is not None:
+            self.audit.record(
+                action="DELETE",
                 entity="Segmentation",
+                actor=self._actor,
                 entity_id=segmentation_id,
-                deleted_data=deleted_data,
+                changes=deleted_data,
             )
         return None
 
     def patch(
         self,
-        session: Session,
         segmentation_id: int,
         *,
         reference_segmentation_id: int | None,
         feature_id: int | None,
         threshold: float | None,
-        actor: ActingUser,
     ) -> Segmentation:
         """Apply the provided (non-None) fields to a segmentation.
-
-        Preserves the pre-refactor audit quirk: reference/feature are applied
-        before the change-string is built, so they log ``<new> -> <new>`` while
-        threshold logs the true ``<old> -> <new>``. Audit-log-only; not an API
-        field. See deferred findings.
 
         Raises:
             NotFoundError: If the segmentation does not exist.
         """
-        segmentation = self.repository.get_by_id(session, segmentation_id)
+        segmentation = self.repository.get_by_id(segmentation_id)
         if segmentation is None:
             raise NotFoundError("Segmentation not found")
+        projects = self.repository.project_ids(segmentation_id)
+        self.scope.require(
+            projects,
+            ProjectRole.grader,
+            entity="Segmentation",
+            entity_id=segmentation_id,
+        )
+        require_owner(
+            self.scope,
+            owner_id=segmentation.CreatorID,
+            entity="Segmentation",
+            entity_id=segmentation_id,
+            projects=projects,
+        )
 
+        # After the floor and the overlay, not before: the caller must be
+        # entitled to modify this row before the request body is judged at all.
+        self._require_reachable_references(
+            reference_segmentation_id=reference_segmentation_id
+        )
+
+        before = AuditService.snapshot(
+            segmentation, "ReferenceSegmentationID", "FeatureID", "Threshold"
+        )
         if reference_segmentation_id is not None:
             segmentation.ReferenceSegmentationID = reference_segmentation_id
         if feature_id is not None:
-            segmentation.FeatureID = feature_id
-        changes: dict[str, str] = {}
-        if reference_segmentation_id is not None:
-            changes["reference_segmentation_id"] = (
-                f"{segmentation.ReferenceSegmentationID} -> "
-                f"{reference_segmentation_id}"
-            )
-            segmentation.ReferenceSegmentationID = reference_segmentation_id
-        if feature_id is not None:
-            changes["feature_id"] = f"{segmentation.FeatureID} -> {feature_id}"
             segmentation.FeatureID = feature_id
         if threshold is not None:
-            changes["threshold"] = f"{segmentation.Threshold} -> {threshold}"
             segmentation.Threshold = threshold
 
-        session.commit()
-        session.refresh(segmentation)
-        if self.logger is not None:
-            self.logger.log_update(
-                user=actor.username,
-                user_id=actor.id,
-                endpoint=f"PATCH /api/segmentations/{segmentation_id}",
+        # Note: this fixes a pre-refactor quirk where reference_segmentation_id
+        # /feature_id were assigned twice, so their hand-built "old -> new"
+        # strings actually logged "new -> new"; threshold was the only field
+        # that logged truthfully. snapshot/diff report true old/new for all three.
+        changes = AuditService.diff(before, segmentation)
+        self.repository.save(segmentation)
+        if self.audit is not None:
+            self.audit.record(
+                action="UPDATE",
                 entity="Segmentation",
+                actor=self._actor,
                 entity_id=segmentation_id,
                 changes=changes if changes else None,
             )
@@ -352,10 +435,8 @@ class SegmentationService:
 
     def tag(
         self,
-        session: Session,
         segmentation_id: int,
         tag_id: int,
-        actor: ActingUser,
     ) -> SegmentationTagLink:
         """Attach a Tag to a segmentation (idempotent).
 
@@ -366,32 +447,44 @@ class SegmentationService:
             NotFoundError: If the segmentation or the tag does not exist.
             BadRequestError: If the tag is not a Segmentation-type tag.
         """
-        segmentation = self.repository.get_by_id(session, segmentation_id)
+        segmentation = self.repository.get_by_id(segmentation_id)
         if segmentation is None:
             raise NotFoundError("Segmentation not found")
-        tag = self.tags.get_by_id(session, tag_id)
+        tag = self.tags.get_by_id(tag_id)
         if tag is None:
             raise NotFoundError("Tag not found")
         if tag.TagType != TagType.Segmentation:
             raise BadRequestError("Tag type must be Segmentation")
+        # A tag link carries no project of its own, so it is authorized against
+        # its *parent* -- the deliberate asymmetry recorded at ``PROJECT_IDS_OF``
+        # (``projects_of(session, SegmentationTagLink, ...)`` raises by design).
+        # The floor therefore names the parent, whose projects it is judged on.
+        # It is the only check here: this method discards the client's comment
+        # rather than writing it, so there is no rewrite of an existing link
+        # for the ownership overlay to guard.
+        self.scope.require(
+            self.repository.project_ids(segmentation_id),
+            ProjectRole.grader,
+            entity="Segmentation",
+            entity_id=segmentation_id,
+        )
 
-        link = self.repository.get_tag_link(session, tag.TagID, segmentation_id)
+        link = self.repository.get_tag_link(tag.TagID, segmentation_id)
         if link is None:
-            link = SegmentationTagLink(
-                TagID=tag.TagID,
-                SegmentationID=segmentation_id,
-                CreatorID=actor.id,
+            link = self.repository.add_link(
+                tag_id=tag.TagID,
+                segmentation_id=segmentation_id,
+                creator_id=self.scope.actor_id,
             )
-            session.add(link)
-            session.commit()
-            session.refresh(link)
-            if self.logger is not None:
-                self.logger.log_insert(
-                    user=actor.username,
-                    user_id=actor.id,
-                    endpoint=f"POST /api/segmentations/{segmentation_id}/tags",
+            if self.audit is not None:
+                # SegmentationTagLink has a composite PK, so entity_id is
+                # null; fold the composite identity into changes (matches
+                # untag's DELETE below), or the audit row is unidentifiable.
+                self.audit.record(
+                    action="INSERT",
                     entity="SegmentationTagLink",
-                    fields={
+                    actor=self._actor,
+                    changes={
                         "tag_id": tag.TagID,
                         "segmentation_id": segmentation_id,
                     },
@@ -402,60 +495,81 @@ class SegmentationService:
 
     def untag(
         self,
-        session: Session,
         segmentation_id: int,
         tag_id: int,
-        actor: ActingUser,
     ) -> None:
         """Remove a Tag from a segmentation (idempotent; no error if unlinked).
 
         Raises:
             NotFoundError: If the segmentation does not exist.
         """
-        segmentation = self.repository.get_by_id(session, segmentation_id)
+        segmentation = self.repository.get_by_id(segmentation_id)
         if segmentation is None:
             raise NotFoundError("Segmentation not found")
+        projects = self.repository.project_ids(segmentation_id)
+        self.scope.require(
+            projects,
+            ProjectRole.grader,
+            entity="Segmentation",
+            entity_id=segmentation_id,
+        )
 
-        link = self.repository.get_tag_link(session, tag_id, segmentation_id)
+        link = self.repository.get_tag_link(tag_id, segmentation_id)
         if link is not None:
+            require_owner_or_project_admin(
+                self.scope,
+                owner_id=link.CreatorID,
+                entity="SegmentationTagLink",
+                entity_id=None,
+                projects=projects,
+            )
             deleted_data = {
                 "tag_id": tag_id,
                 "segmentation_id": segmentation_id,
                 "creator_id": link.CreatorID,
             }
-            session.delete(link)
-            session.commit()
-            if self.logger is not None:
-                self.logger.log_delete(
-                    user=actor.username,
-                    user_id=actor.id,
-                    endpoint=(
-                        f"DELETE /api/segmentations/{segmentation_id}"
-                        f"/tags/{tag_id}"
-                    ),
+            self.repository.delete_link(link)
+            if self.audit is not None:
+                self.audit.record(
+                    action="DELETE",
                     entity="SegmentationTagLink",
-                    fields={"tag_id": tag_id, "segmentation_id": segmentation_id},
-                    deleted_data=deleted_data,
+                    actor=self._actor,
+                    changes=deleted_data,
                 )
         return None
 
 
 class ModelSegmentationService:
-    """Business logic for ModelSegmentation binary data endpoints."""
+    """Business logic for ModelSegmentation binary data endpoints.
+
+    The deliberate hole in the ownership overlay. ``ModelSegmentation`` carries
+    no ``CreatorID``, so "deny unless ``CreatorID`` is the actor" would match
+    nobody and refuse every actor forever — including the grader correcting
+    model output on the live endpoint. The write is gated by scope plus
+    ``grader`` and nothing else.
+
+    Audit is therefore not optional here but compensatory: because the row
+    cannot record who changed it, the ``AuditLog`` row is the only place that
+    author exists. (This replaces an earlier "no audit" note, which recorded
+    the pre-refactor behaviour that this exemption now has to make good.)
+    """
 
     def __init__(
         self,
         repository: ModelSegmentationRepository,
         data_store: SegmentationDataStore,
-        logger: DatabaseModificationLogger | None = None,
+        *,
+        scope: AccessScope,
+        audit: AuditService | None = None,
     ) -> None:
         self.repository = repository
         self.store = data_store
-        self.logger = logger
+        self.scope = scope
+        self._actor = ActingUser.from_scope(scope)
+        self.audit = audit
 
     def read_data(
         self,
-        session: Session,
         model_segmentation_id: int,
         *,
         axis: Optional[int] = None,
@@ -467,7 +581,7 @@ class ModelSegmentationService:
             NotFoundError: If the model segmentation does not exist.
             BadRequestError: If the store rejects the read parameters.
         """
-        item = self.repository.get_by_id(session, model_segmentation_id)
+        item = self.repository.get_by_id(model_segmentation_id)
         if item is None:
             raise NotFoundError("ModelSegmentation data not found")
         try:
@@ -477,7 +591,6 @@ class ModelSegmentationService:
 
     def write_data(
         self,
-        session: Session,
         model_segmentation_id: int,
         data: np.ndarray,
         *,
@@ -490,34 +603,63 @@ class ModelSegmentationService:
             NotFoundError: If the model segmentation does not exist.
             BadRequestError: If the store rejects the write.
         """
-        item = self.repository.get_by_id(session, model_segmentation_id)
+        item = self.repository.get_by_id(model_segmentation_id)
         if item is None:
             raise NotFoundError("ModelSegmentation data not found")
+        # Scope plus the grader floor is the whole check: see the class
+        # docstring for why no ownership overlay can apply to this entity.
+        projects = self.repository.project_ids(model_segmentation_id)
+        self.scope.require(
+            projects,
+            ProjectRole.grader,
+            entity="ModelSegmentation",
+            entity_id=model_segmentation_id,
+        )
+        # Store write MUST stay before the repo write here (unchanged order
+        # from pre-refactor: store.write -> session.add). Zarr I/O is not
+        # part of the DB transaction — see the class-level note on atomicity.
         try:
             self.store.write(item, data, axis=axis, slice_index=scan_nr)
         except (IndexError, ValueError) as e:
             raise BadRequestError(str(e)) from e
-        session.add(item)
-        session.commit()
-        session.refresh(item)
+        self.repository.save(item)
+        if self.audit is not None:
+            # A ModelSegmentation resolves through one image to exactly one
+            # project, so the set is a singleton.
+            self.audit.record(
+                action="UPDATE",
+                entity="ModelSegmentation",
+                actor=self._actor,
+                entity_id=model_segmentation_id,
+                project_id=next(iter(projects), None),
+                changes={"axis": axis, "scan_nr": scan_nr},
+            )
         return item
 
 
-def get_segmentation_service() -> SegmentationService:
+def get_segmentation_service(
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(get_access_scope),
+) -> SegmentationService:
     """Default SegmentationService wiring for FastAPI ``Depends()``."""
     return SegmentationService(
-        SegmentationRepository(),
-        ImageInstanceRepository(),
-        TagRepository(),
+        SegmentationRepository(db, scope=scope),
+        ImageInstanceRepository(db, scope=scope),
+        TagRepository(db, scope=scope),
         get_segmentation_data_store(),
-        logger=get_db_logger(),
+        scope=scope,
+        audit=get_audit_service(db),
     )
 
 
-def get_model_segmentation_service() -> ModelSegmentationService:
+def get_model_segmentation_service(
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(get_access_scope),
+) -> ModelSegmentationService:
     """Default ModelSegmentationService wiring for FastAPI ``Depends()``."""
     return ModelSegmentationService(
-        ModelSegmentationRepository(),
+        ModelSegmentationRepository(db, scope=scope),
         get_segmentation_data_store(),
-        logger=get_db_logger(),
+        scope=scope,
+        audit=get_audit_service(db),
     )

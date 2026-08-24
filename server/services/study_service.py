@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+from fastapi import Depends
 from sqlalchemy.orm import Session
 
 from eyened_orm import StudyTagLink
 from eyened_orm.tag import TagType
 from eyened_orm.repositories.study_repository import StudyRepository
+from eyened_orm.authz.ownership import require_owner, require_owner_or_project_admin
+from eyened_orm.authz.roles import ProjectRole
+from eyened_orm.authz.scope import AccessScope
 
-from ..utils.db_logging import DatabaseModificationLogger, get_db_logger
+from ..db import get_db
+from .access_scope import get_access_scope
 from .acting_user import ActingUser
+from .audit_service import AuditService, get_audit_service
 from .exceptions import BadRequestError, NotFoundError
 
 
@@ -17,18 +23,20 @@ class StudyService:
     def __init__(
         self,
         repository: StudyRepository,
-        logger: DatabaseModificationLogger | None = None,
+        *,
+        scope: AccessScope,
+        audit: AuditService | None = None,
     ) -> None:
         self.repository = repository
-        self.logger = logger
+        self.scope = scope
+        self._actor = ActingUser.from_scope(scope)
+        self.audit = audit
 
     def tag_study(
         self,
-        session: Session,
         study_id: int,
         tag_id: int,
         comment: str | None,
-        actor: ActingUser,
     ) -> StudyTagLink:
         """Attach a Study tag to a study (idempotent; updates comment if linked).
 
@@ -36,74 +44,104 @@ class StudyService:
             NotFoundError: If the study or tag does not exist.
             BadRequestError: If the tag's type is not ``TagType.Study``.
         """
-        study = self.repository.get_by_id(session, study_id)
+        study = self.repository.get_by_id(study_id)
         if study is None:
             raise NotFoundError(f"Study {study_id} not found")
-        tag = self.repository.get_tag(session, tag_id)
+        tag = self.repository.get_tag(tag_id)
         if tag is None:
             raise NotFoundError(f"Tag {tag_id} not found")
         if tag.TagType != TagType.Study:
             raise BadRequestError("Tag type must be Study")
+        # A tag link carries no project of its own, so it is authorized against
+        # its *parent* -- the deliberate asymmetry recorded at ``PROJECT_IDS_OF``
+        # (``projects_of(session, StudyTagLink, ...)`` raises by design). The
+        # floor therefore names the parent, whose projects it is judged on; the
+        # ownership overlay names the link, whose CreatorID it reads, with
+        # ``entity_id=None`` because a link's primary key is composite.
+        projects = self.repository.project_ids(study_id)
+        self.scope.require(
+            projects, ProjectRole.grader, entity="Study", entity_id=study_id
+        )
 
-        link = self.repository.get_link(session, tag_id, study_id)
+        link = self.repository.get_link(tag_id, study_id)
         if link is None:
-            link = StudyTagLink(
-                TagID=tag.TagID,
-                StudyID=study_id,
-                CreatorID=actor.id,
-                Comment=comment,
+            link = self.repository.add_link(
+                tag_id=tag.TagID,
+                study_id=study_id,
+                creator_id=self.scope.actor_id,
+                comment=comment,
             )
-            session.add(link)
-            session.commit()
-            session.refresh(link)
             link.Tag = tag
-            if self.logger is not None:
-                self.logger.log_insert(
-                    user=actor.username,
-                    user_id=actor.id,
-                    endpoint=f"POST /api/studies/{study_id}/tags",
+            if self.audit is not None:
+                self.audit.record(
+                    action="INSERT",
                     entity="StudyTagLink",
-                    fields={
+                    actor=self._actor,
+                    changes={
                         "tag_id": tag.TagID,
                         "study_id": study_id,
                         "comment": comment,
                     },
                 )
         elif comment is not None:
-            old_comment = link.Comment
+            # This branch overwrites an existing link's comment, so it is a
+            # modify and takes the same overlay ``patch_study_tag`` does.
+            # Without it POST would be a standing bypass of PATCH's check.
+            require_owner(
+                self.scope,
+                owner_id=link.CreatorID,
+                entity="StudyTagLink",
+                entity_id=None,
+                projects=projects,
+            )
+            before = AuditService.snapshot(link, "Comment")
             link.Comment = comment
-            session.commit()
-            session.refresh(link)
+            # StudyTagLink has a composite PK, so entity_id is null; fold the
+            # composite identity into changes (matches the INSERT branch above
+            # and the DELETE below), or the audit row is unidentifiable.
+            changes = {
+                "tag_id": tag.TagID,
+                "study_id": study_id,
+                **AuditService.diff(before, link),
+            }
+            self.repository.save_link(link)
             link.Tag = tag
-            if self.logger is not None:
-                self.logger.log_update(
-                    user=actor.username,
-                    user_id=actor.id,
-                    endpoint=f"POST /api/studies/{study_id}/tags",
+            if self.audit is not None:
+                self.audit.record(
+                    action="UPDATE",
                     entity="StudyTagLink",
-                    fields={"tag_id": tag.TagID, "study_id": study_id},
-                    changes={"comment": f"{old_comment} -> {comment}"},
+                    actor=self._actor,
+                    changes=changes,
                 )
         return link
 
     def untag_study(
         self,
-        session: Session,
         study_id: int,
         tag_id: int,
-        actor: ActingUser,
     ) -> None:
         """Remove a Study tag from a study (idempotent).
 
         Raises:
             NotFoundError: If the study does not exist.
         """
-        study = self.repository.get_by_id(session, study_id)
+        study = self.repository.get_by_id(study_id)
         if study is None:
             raise NotFoundError(f"Study {study_id} not found")
-        link = self.repository.get_link(session, tag_id, study_id)
+        projects = self.repository.project_ids(study_id)
+        self.scope.require(
+            projects, ProjectRole.grader, entity="Study", entity_id=study_id
+        )
+        link = self.repository.get_link(tag_id, study_id)
         if link is None:
             return None
+        require_owner_or_project_admin(
+            self.scope,
+            owner_id=link.CreatorID,
+            entity="StudyTagLink",
+            entity_id=None,
+            projects=projects,
+        )
 
         deleted_data = {
             "tag_id": tag_id,
@@ -111,26 +149,21 @@ class StudyService:
             "comment": link.Comment,
             "creator_id": link.CreatorID,
         }
-        session.delete(link)
-        session.commit()
-        if self.logger is not None:
-            self.logger.log_delete(
-                user=actor.username,
-                user_id=actor.id,
-                endpoint=f"DELETE /api/studies/{study_id}/tags/{tag_id}",
+        self.repository.delete_link(link)
+        if self.audit is not None:
+            self.audit.record(
+                action="DELETE",
                 entity="StudyTagLink",
-                fields={"tag_id": tag_id, "study_id": study_id},
-                deleted_data=deleted_data,
+                actor=self._actor,
+                changes=deleted_data,
             )
         return None
 
     def patch_study_tag(
         self,
-        session: Session,
         study_id: int,
         tag_id: int,
         comment: str | None,
-        actor: ActingUser,
     ) -> StudyTagLink:
         """Update the comment on an existing Study tag link.
 
@@ -138,36 +171,59 @@ class StudyService:
             NotFoundError: If the study, tag, or link does not exist.
             BadRequestError: If the tag's type is not ``TagType.Study``.
         """
-        study = self.repository.get_by_id(session, study_id)
+        study = self.repository.get_by_id(study_id)
         if study is None:
             raise NotFoundError(f"Study {study_id} not found")
-        tag = self.repository.get_tag(session, tag_id)
+        tag = self.repository.get_tag(tag_id)
         if tag is None:
             raise NotFoundError(f"Tag {tag_id} not found")
         if tag.TagType != TagType.Study:
             raise BadRequestError("Tag type must be Study")
-        link = self.repository.get_link(session, tag_id, study_id)
+        projects = self.repository.project_ids(study_id)
+        self.scope.require(
+            projects, ProjectRole.grader, entity="Study", entity_id=study_id
+        )
+        link = self.repository.get_link(tag_id, study_id)
         if link is None:
             raise NotFoundError(f"Tag {tag_id} is not linked to study {study_id}")
+        require_owner(
+            self.scope,
+            owner_id=link.CreatorID,
+            entity="StudyTagLink",
+            entity_id=None,
+            projects=projects,
+        )
 
         if comment is not None:
-            old_comment = link.Comment
+            before = AuditService.snapshot(link, "Comment")
             link.Comment = comment
-            session.commit()
-            session.refresh(link)
-            if self.logger is not None:
-                self.logger.log_update(
-                    user=actor.username,
-                    user_id=actor.id,
-                    endpoint=f"PATCH /api/studies/{study_id}/tags/{tag_id}",
+            # StudyTagLink has a composite PK, so entity_id is null; fold the
+            # composite identity into changes (matches tag_study's INSERT/UPDATE
+            # and untag_study's DELETE), or the audit row is unidentifiable.
+            changes = {
+                "tag_id": tag_id,
+                "study_id": study_id,
+                **AuditService.diff(before, link),
+            }
+            self.repository.save_link(link)
+            if self.audit is not None:
+                self.audit.record(
+                    action="UPDATE",
                     entity="StudyTagLink",
-                    fields={"tag_id": tag_id, "study_id": study_id},
-                    changes={"comment": f"{old_comment} -> {comment}"},
+                    actor=self._actor,
+                    changes=changes,
                 )
         link.Tag = tag
         return link
 
 
-def get_study_service() -> StudyService:
+def get_study_service(
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(get_access_scope),
+) -> StudyService:
     """Default StudyService wiring for FastAPI ``Depends()``."""
-    return StudyService(StudyRepository(), logger=get_db_logger())
+    return StudyService(
+        StudyRepository(db, scope=scope),
+        scope=scope,
+        audit=get_audit_service(db),
+    )
