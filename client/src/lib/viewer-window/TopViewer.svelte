@@ -1,8 +1,13 @@
 <script lang="ts">
 	import Viewer from "$lib/viewer/Viewer.svelte";
+	import { instances } from "$lib/data/stores.svelte";
+	import { resolveEnfaceOverlaySources } from "$lib/registration/resolveEnfaceOverlaySources";
+	import { EnfaceProjectionOverlay } from "$lib/viewer/overlays/EnfaceProjectionOverlay";
+	import type { EnfaceProjectionMode } from "$lib/viewer/viewer-utils";
 	import { getContext, setContext } from "svelte";
 	import type { ViewerWindowContext } from "./viewerWindowContext.svelte";
 	import type { AbstractImage } from "$lib/webgl/abstractImage";
+	import EnfaceProjectionModeIcon from "./icons/EnfaceProjectionModeIcon.svelte";
 	import MainIcon from "./icons/MainIcon.svelte";
 	import { OCTLinesOverlay } from "$lib/viewer/overlays/OCTLinesOverlays";
 	import Lines from "./icons/Lines.svelte";
@@ -19,6 +24,38 @@
 
 	const viewerContext = viewerWindowContext.topViewers.get(image)!;
 	setContext("viewerContext", viewerContext);
+	const isProjectionImage = $derived(image.image_id.endsWith("_proj"));
+	const resolved = $derived.by(() =>
+		resolveEnfaceOverlaySources({
+			imageId: image.image_id,
+			imageWidth: image.width,
+			imageHeight: image.height,
+			registration: viewerWindowContext.registration,
+			managers: viewerWindowContext.enfaceProjectionManagers,
+			getImageSize: (imageId) => {
+				for (const [candidate] of viewerWindowContext.topViewers) {
+					if (candidate.image_id === imageId) {
+						return [candidate.width, candidate.height];
+					}
+				}
+				if (imageId.endsWith("_proj")) {
+					const octId = imageId.slice(0, -"_proj".length);
+					const manager = viewerWindowContext.enfaceProjectionManagers.get(octId);
+					if (manager) return [manager.octImage.width, manager.octImage.depth];
+				}
+				const metadata = instances.get(imageId);
+				return metadata ? [metadata.columns, metadata.rows] : undefined;
+			},
+			projMode: viewerContext.enfaceProjectionMode,
+			linkedModes: viewerContext.enfaceProjectionModesByOct,
+		}),
+	);
+	const paintSources = $derived.by(() =>
+		resolved.flatMap((source) => {
+			const mainViewerContext = source.manager.mainViewerContext;
+			return mainViewerContext ? [{ ...source, mainViewerContext }] : [];
+		}),
+	);
 
 	// const registration = viewerContext.registration;
 	// let linkedImages = $derived(registration.getLinkedImgIds(image.image_id));
@@ -43,9 +80,27 @@
 		}
 		return removeOverlay;
 	});
+
+	$effect(() => {
+		const sources = paintSources.filter((source) => source.mode !== "off");
+		if (!sources.length) return;
+		const overlay = new EnfaceProjectionOverlay(sources, image.webgl);
+		const remove = viewerContext.addOverlay(overlay);
+		return () => {
+			remove();
+			overlay.destroy();
+		};
+	});
 	function toggleOverlay(e: MouseEvent) {
 		e.stopPropagation();
 		hideOverlay = !hideOverlay;
+	}
+
+	function cycleProjectionMode(e: MouseEvent) {
+		e.stopPropagation();
+		const modes: EnfaceProjectionMode[] = ["off", "binary", "heatmap"];
+		const index = modes.indexOf(viewerContext.enfaceProjectionMode);
+		viewerContext.enfaceProjectionMode = modes[(index + 1) % modes.length];
 	}
 
 	function selectImage(e: any) {
@@ -61,15 +116,28 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="item" class:wide={image.is3D} onclick={(e) => selectImage(e)}>
 	<Viewer showInfo={false} />
-	{#if hasLocators}
+	{#if hasLocators || resolved.length > 0}
 		<div class="header overlay">
 			<div class="content outer">
 				<div class="content">
-					<MainIcon
-						onclick={toggleOverlay}
-						active={!hideOverlay}
-						Icon={Lines}
-					/>
+					{#if isProjectionImage && resolved.length > 0}
+						<MainIcon
+							onclick={cycleProjectionMode}
+							active={viewerContext.enfaceProjectionMode !== "off"}
+							tooltip="Toggle enface segmentation projection"
+						>
+							{#snippet iconSnippet()}
+								<EnfaceProjectionModeIcon mode={viewerContext.enfaceProjectionMode} />
+							{/snippet}
+						</MainIcon>
+					{/if}
+					{#if hasLocators}
+						<MainIcon
+							onclick={toggleOverlay}
+							active={!hideOverlay}
+							Icon={Lines}
+						/>
+					{/if}
 				</div>
 			</div>
 		</div>

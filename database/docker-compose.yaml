@@ -1,4 +1,4 @@
-name: eyeneed-bundle-database
+name: eyened-bundle-database
 
 services:
   database:

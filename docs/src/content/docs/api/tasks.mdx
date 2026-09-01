@@ -25,6 +25,12 @@ Partial update (`name`, `description`, `contact_id`, `task_definition_id`, `task
 
 ### DELETE /api/task/\{task_id\}
 
+### POST /api/task/\{task_id\}/subtasks
+
+Create an unassigned `NotStarted` subtask. Admin only.
+
+**Request body:** `{ "comments": "string" | null }`
+
 ### GET /api/task/\{task_id\}/subtasks
 
 List subtasks with optional pagination and images.

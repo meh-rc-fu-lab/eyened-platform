@@ -143,8 +143,8 @@ restore_from_container_id() {
 
 # Try copying from local images.
 declare -a CANDIDATE_IMAGES=(
-    "eyeneed-bundle-medsam:latest"
-    "eyeneed-bundle-medsam"
+    "eyened-bundle-medsam:latest"
+    "eyened-bundle-medsam"
     "eyened-bundle-medsam:latest"
     "eyened-bundle-medsam"
     "medsam:latest"

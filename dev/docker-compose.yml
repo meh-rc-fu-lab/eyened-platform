@@ -48,6 +48,7 @@ services:
     volumes:
       - ../server:/app/server
       - ../orm:/app/orm
+      - ${EYENED_QNAP_ROOT:-/mnt/qnap-rc-02/Eyened-temp-for-test}:${EYENED_QNAP_ROOT:-/mnt/qnap-rc-02/Eyened-temp-for-test}
       # current solution for zarr storage is to mount it to the server container
       #- <filestorage_mount>:<filestorage_mount>:ro
     depends_on:

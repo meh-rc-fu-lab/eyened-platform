@@ -13,7 +13,7 @@ import { UpdatePosition } from './controls/updatePosition';
 import { ZoomPan } from './controls/zoomPan';
 import { CursorOverlay } from './overlays/CursorOverlay';
 import type { MeasureTool } from './tools/Measure.svelte.js';
-import type { EventName, Overlay, PanelName, RenderMode, ViewerEvent, ViewerEventListener, WindowLevel } from './viewer-utils';
+import type { EnfaceProjectionMode, EventName, Overlay, PanelName, RenderMode, ViewerEvent, ViewerEventListener, WindowLevel } from './viewer-utils';
 
 export type cursorStyle = 'default' | 'none' | 'help' | 'pointer' | 'progress' | 'wait' | 'crosshair' | 'text' | 'vertical-text' | 'alias' | 'copy' | 'move' | 'no-drop' | 'not-allowed' | 'grab' | 'grabbing' | 'all-scroll' | 'col-resize' | 'row-resize' | 'n-resize' | 'e-resize' | 's-resize' | 'w-resize' | 'ne-resize' | 'nw-resize' | 'se-resize' | 'sw-resize' | 'ew-resize' | 'ns-resize' | 'nesw-resize' | 'nwse-resize' | 'zoom-in' | 'zoom-out';
 
@@ -25,6 +25,8 @@ export class ViewerContext {
 
     hideOverlays: boolean = $state(false);
     renderMode: RenderMode = $state('Original');
+    enfaceProjectionMode: EnfaceProjectionMode = $state('off');
+    enfaceProjectionModesByOct: Map<string, EnfaceProjectionMode> = $state(new Map());
     lockScroll: boolean = $state(false);
     windowLevel: WindowLevel = $state({ min: 0, max: 255 });
     cursorStyle: cursorStyle = $state('default');
@@ -124,6 +126,15 @@ export class ViewerContext {
         }
         this.viewerWindowContext.registration.setPosition(this.image.image_id, { x, y, index: i });
         this.index = i;
+    }
+
+    cycleEnfaceProjectionModeForOct(octPublicId: string): void {
+        const modes: EnfaceProjectionMode[] = ["off", "binary", "heatmap"];
+        const current = this.enfaceProjectionModesByOct.get(octPublicId) ?? "off";
+        const next = modes[(modes.indexOf(current) + 1) % modes.length];
+        const updatedModes = new Map(this.enfaceProjectionModesByOct);
+        updatedModes.set(octPublicId, next);
+        this.enfaceProjectionModesByOct = updatedModes;
     }
 
     initTransform() {

@@ -4,6 +4,8 @@ import type { ViewerContext } from "./viewerContext.svelte";
 
 export type RenderMode = 'Original' | 'Luminance' | 'Contrast enhanced' | 'Color balanced' | 'CLAHE' | 'Sharpened' | 'Histogram matched' | 'Red' | 'Green' | 'Blue';
 
+export type EnfaceProjectionMode = 'off' | 'binary' | 'heatmap';
+
 export type WindowLevel = { min: number; max: number; };
 
 export type PanelName = (

@@ -40,23 +40,53 @@
         creator_id: number | null;
     };
 
+    type SDDRow = {
+        row_key: string;
+        grader?: number | null;
+        SubTaskID?: unknown;
+        subtask_id?: number | null;
+        subtask_assignee_user_id?: number | null;
+        subtask_assignee_username?: string | null;
+        [column: string]: unknown;
+    };
+
     let loading = $state(true);
     let error = $state("");
     let info = $state("");
     let accessDenied = $state(false);
 
-    let activeTab = $state<"users" | "tasks" | "cvi">("users");
+    let activeTab = $state<"users" | "tasks" | "cvi" | "sdd">("users");
 
     let users = $state<AdminUser[]>([]);
     let tasks = $state<TaskRow[]>([]);
     let selectedTaskId = $state<number | null>(null);
     let subtasks = $state<SubtaskRow[]>([]);
+    let newSubtaskComments = $state("");
     let cviRows = $state<CVIRow[]>([]);
     let cviTotal = $state(0);
     let cviSearch = $state("");
     let cviSubtaskOptions = $state<CVISubtaskOption[]>([]);
     let cviPage = $state(1);
     let cviLimit = $state(100);
+    let sddRows = $state<SDDRow[]>([]);
+    let sddColumns = $state<string[]>([]);
+    let sddSubtaskColumn = $state<string | null>(null);
+    let sddSubtaskOptions = $state<CVISubtaskOption[]>([]);
+    let sddSubtaskId = $state("");
+    let sddAssigneeId = $state("");
+    let selectedSddRowKeys = $state<Set<string>>(new Set());
+    let sddLoading = $state(false);
+    let sddPage = $state(1);
+    let sddLimit = $state(100);
+    let sddTotal = $state(0);
+
+    const sddTotalPages = $derived(Math.max(1, Math.ceil(sddTotal / sddLimit)));
+    const sddOffset = $derived((sddPage - 1) * sddLimit);
+    const sddFrom = $derived(sddTotal === 0 ? 0 : sddOffset + 1);
+    const sddTo = $derived(Math.min(sddOffset + sddRows.length, sddTotal));
+    const allSddRowsSelected = $derived(
+        sddRows.length > 0 && sddRows.every((row) => selectedSddRowKeys.has(row.row_key)),
+    );
 
     let newUsername = $state("");
     let newPassword = $state("");
@@ -252,6 +282,25 @@
         await loadSubtasks();
     }
 
+    async function createSubtask() {
+        if (selectedTaskId == null) return;
+
+        error = "";
+        info = "";
+        const res = await fetchApi(`/task/${selectedTaskId}/subtasks`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ comments: newSubtaskComments.trim() || null }),
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to create subtask (${res.status})`);
+        }
+
+        newSubtaskComments = "";
+        info = "Subtask created";
+        await Promise.all([loadSubtasks(), loadTasks()]);
+    }
+
     async function assignCviRow(rowId: string | number, subtaskId: string) {
         error = "";
         info = "";
@@ -270,6 +319,157 @@
         await loadCviRows();
         await loadTasks();
         await loadCviSubtaskOptions();
+    }
+
+    async function loadSddRows() {
+        const res = await fetchApi("/sdd/assignment", {
+            query: { limit: sddLimit, offset: sddOffset },
+        });
+        if (!res.ok) throw new Error(`Failed to load SDD assignments (${res.status})`);
+        const payload = (await res.json()) as {
+            columns: string[];
+            subtask_column: string | null;
+            rows: SDDRow[];
+            total: number;
+        };
+        sddTotal = payload.total ?? 0;
+        sddSubtaskColumn = payload.subtask_column ?? null;
+        const excluded = ["row_key", "image_url", "grader"];
+        if (sddSubtaskColumn) {
+            excluded.push(sddSubtaskColumn);
+        }
+        sddColumns = (payload.columns ?? []).filter((column) => !excluded.includes(column));
+        sddRows = payload.rows ?? [];
+        selectedSddRowKeys = new Set();
+    }
+
+    async function prevSddPage() {
+        if (sddPage <= 1) return;
+        sddPage -= 1;
+        await loadSddRows();
+    }
+
+    async function nextSddPage() {
+        if (sddPage >= sddTotalPages) return;
+        sddPage += 1;
+        await loadSddRows();
+    }
+
+    async function openSddTab() {
+        activeTab = "sdd";
+        if (sddLoading) return;
+
+        sddLoading = true;
+        error = "";
+        try {
+            await loadSddRows();
+        } catch (err) {
+            error = err instanceof Error ? err.message : "Failed to load SDD assignments";
+        } finally {
+            sddLoading = false;
+        }
+
+        try {
+            await loadSddSubtaskOptions();
+        } catch (err) {
+            error = err instanceof Error ? err.message : "Failed to load SDD subtasks";
+        }
+    }
+
+    async function assignSddRowSubtask(rowKey: string, subtaskId: string) {
+        error = "";
+        info = "";
+        const res = await fetchApi(`/sdd/assignment/${encodeURIComponent(rowKey)}/subtask`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ subtask_id: subtaskId ? Number(subtaskId) : null }),
+        });
+        if (!res.ok) {
+            const detail = await res.json().catch(() => null) as { detail?: string } | null;
+            throw new Error(detail?.detail ?? `Failed to assign SDD SubTaskID (${res.status})`);
+        }
+        info = "Updated SDD SubTaskID";
+        await loadSddRows();
+    }
+
+    async function loadSddSubtaskOptions() {
+        sddSubtaskOptions = [];
+        const sddTask = tasks.find((t) => t.id === 65 || (t.name && t.name.toLowerCase().includes("sdd")));
+        if (!sddTask) {
+            return;
+        }
+
+        const res = await fetchApi(`/task/${sddTask.id}/subtasks`, {
+            query: { with_images: false, limit: 2000, page: 0 },
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to load SDD subtasks (${res.status})`);
+        }
+        const payload = (await res.json()) as { subtasks: SubtaskRow[] };
+        sddSubtaskOptions = (payload.subtasks ?? []).map((st) => ({
+            id: st.id,
+            task_state: st.task_state,
+            creator_id: st.creator_id,
+        }));
+    }
+
+    async function assignSddSubtask() {
+        const subtaskId = Number(sddSubtaskId.trim());
+        if (!Number.isInteger(subtaskId) || subtaskId < 1) {
+            error = "Select a valid SubTaskID.";
+            return;
+        }
+        if (selectedSddRowKeys.size === 0) {
+            error = "Select at least one SDD row.";
+            return;
+        }
+
+        error = "";
+        info = "";
+        const rowKeys = [...selectedSddRowKeys];
+        const results = await Promise.all(
+            rowKeys.map(async (rowKey) => {
+                const res = await fetchApi(`/sdd/assignment/${encodeURIComponent(rowKey)}/subtask`, {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ subtask_id: subtaskId }),
+                });
+                if (!res.ok) {
+                    const detail = await res.json().catch(() => null) as { detail?: string } | null;
+                    throw new Error(detail?.detail ?? `Failed to assign SDD SubTaskID (${res.status})`);
+                }
+            }),
+        );
+        void results;
+
+        const res = await fetchApi(`/subtasks/${subtaskId}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ creator_id: sddAssigneeId ? Number(sddAssigneeId) : null }),
+        });
+        if (!res.ok) {
+            const detail = await res.json().catch(() => null) as { detail?: string } | null;
+            throw new Error(detail?.detail ?? `Failed to assign SDD subtask user (${res.status})`);
+        }
+
+        info = `Assigned SubTaskID ${subtaskId} and user to ${rowKeys.length} SDD row(s)`;
+        await loadSddRows();
+    }
+
+    function toggleSddRow(rowKey: string, checked: boolean) {
+        const selected = new Set(selectedSddRowKeys);
+        if (checked) {
+            selected.add(rowKey);
+        } else {
+            selected.delete(rowKey);
+        }
+        selectedSddRowKeys = selected;
+    }
+
+    function toggleAllSddRows(checked: boolean) {
+        selectedSddRowKeys = checked
+            ? new Set(sddRows.map((row) => row.row_key))
+            : new Set();
     }
 
     async function initPage() {
@@ -315,9 +515,10 @@
                 {/if}
 
                 <div class="tabs">
-                    <button class:active={activeTab === "users"} onclick={() => (activeTab = "users")}>Users</button>
-                    <button class:active={activeTab === "tasks"} onclick={() => (activeTab = "tasks")}>Tasks</button>
-                    <button class:active={activeTab === "cvi"} onclick={() => (activeTab = "cvi")}>CVI</button>
+                    <button type="button" class:active={activeTab === "users"} onclick={() => (activeTab = "users")}>Users</button>
+                    <button type="button" class:active={activeTab === "tasks"} onclick={() => (activeTab = "tasks")}>Tasks</button>
+                    <button type="button" class:active={activeTab === "cvi"} onclick={() => (activeTab = "cvi")}>CVI</button>
+                    <button type="button" class:active={activeTab === "sdd"} onclick={openSddTab}>SDD</button>
                 </div>
 
                 {#if activeTab === "users"}
@@ -374,6 +575,8 @@
                                     <option value={task.id}>{task.name} ({task.num_tasks ?? 0})</option>
                                 {/each}
                             </select>
+                            <input placeholder="Optional comments" bind:value={newSubtaskComments} />
+                            <button onclick={createSubtask} disabled={selectedTaskId == null}>Create subtask</button>
                         </div>
 
                         <table>
@@ -477,6 +680,96 @@
                         </table>
                     </section>
                 {/if}
+
+                {#if activeTab === "sdd"}
+                    <section class="panel">
+                        <h2>SDD Assignment</h2>
+                        {#if sddLoading}
+                            <p>Loading SDDGradingData...</p>
+                        {:else}
+                        <div class="task-controls">
+                            <span>Total: {sddTotal}</span>
+                            <span>Showing: {sddFrom}-{sddTo}</span>
+                            <span>Page {sddPage} / {sddTotalPages}</span>
+                            <button type="button" onclick={prevSddPage} disabled={sddPage <= 1}>Prev</button>
+                            <button type="button" onclick={nextSddPage} disabled={sddPage >= sddTotalPages}>Next</button>
+                            <label for="sddSubtaskId">SubTaskID:</label>
+                            <select id="sddSubtaskId" bind:value={sddSubtaskId}>
+                                <option value="">Select SubTaskID</option>
+                                {#each sddSubtaskOptions as subtask (subtask.id)}
+                                    <option value={subtask.id}>{subtask.id} ({subtask.task_state})</option>
+                                {/each}
+                            </select>
+                            <select aria-label="SDD assignee" bind:value={sddAssigneeId}>
+                                <option value="">Unassigned</option>
+                                {#each users as user (user.id)}
+                                    <option value={user.id}>{user.username}</option>
+                                {/each}
+                            </select>
+                            <button onclick={assignSddSubtask}>Assign user to rows</button>
+                        </div>
+                        <div class="sdd-table-scroll" tabindex="0" aria-label="SDD grading data">
+                            <table class="sdd-table">
+                                <thead>
+                                    <tr>
+                                        <th>
+                                            <input
+                                                type="checkbox"
+                                                aria-label="Select all SDD rows on this page"
+                                                checked={allSddRowsSelected}
+                                                onchange={(event) => toggleAllSddRows((event.currentTarget as HTMLInputElement).checked)}
+                                            />
+                                        </th>
+                                        {#each sddColumns as column}
+                                            <th>{column}</th>
+                                        {/each}
+                                        {#if sddSubtaskColumn}
+                                        <th>SubTaskID</th>
+                                        <th>SubTask Assignee</th>
+                                        {/if}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {#each sddRows as row, index (row.row_key ? `${row.row_key}-${index}` : index)}
+                                        <tr>
+                                            <td>
+                                                <input
+                                                    type="checkbox"
+                                                    aria-label="Select SDD row"
+                                                    checked={selectedSddRowKeys.has(row.row_key)}
+                                                    onchange={(event) => toggleSddRow(row.row_key, (event.currentTarget as HTMLInputElement).checked)}
+                                                />
+                                            </td>
+                                            {#each sddColumns as column}
+                                                <td>{row[column] == null ? "" : String(row[column])}</td>
+                                            {/each}
+                                            {#if sddSubtaskColumn}
+                                        <td>
+                                            <select value={row.subtask_id ?? ""} onchange={(event) => assignSddRowSubtask(row.row_key, (event.currentTarget as HTMLSelectElement).value)}>
+                                                <option value="">Unassigned</option>
+                                                {#each sddSubtaskOptions as subtask (subtask.id)}
+                                                    <option value={subtask.id}>{subtask.id} ({subtask.task_state})</option>
+                                                {/each}
+                                            </select>
+                                        </td>
+                                        <td>
+                                            {#if row.subtask_assignee_user_id}
+                                                {row.subtask_assignee_username ?? `User ${row.subtask_assignee_user_id}`}
+                                            {:else}
+                                                -
+                                            {/if}
+                                        </td>
+                                        {/if}
+                                    </tr>
+                                {:else}
+                                    <tr><td colspan={sddColumns.length + (sddSubtaskColumn ? 3 : 1)}>No SDD records found.</td></tr>
+                                {/each}
+                                </tbody>
+                            </table>
+                        </div>
+                        {/if}
+                    </section>
+                {/if}
             {/if}
         </div>
     {/snippet}
@@ -531,6 +824,15 @@
         width: 100%;
         border-collapse: collapse;
         font-size: 13px;
+    }
+
+    .sdd-table-scroll {
+        width: 100%;
+        overflow-x: auto;
+    }
+
+    .sdd-table {
+        min-width: max-content;
     }
 
     th,

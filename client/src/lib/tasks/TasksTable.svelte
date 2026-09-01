@@ -18,6 +18,10 @@
 		return task.name.toLowerCase().includes("cvi");
 	}
 
+	function isSddTask(task: TaskGET): boolean {
+		return task.id === 65 || task.name.toLowerCase().includes("sdd");
+	}
+
 	const columns: ColumnDef<TaskGET>[] = [
 		{
 			accessorKey: "name",
@@ -26,6 +30,8 @@
 				const r = row.original as TaskGET;
 				const url = isCviTask(r)
 					? "/cvi"
+					: isSddTask(r)
+						? "/sdd"
 					: `/tasks/${r.id}${typeof window !== "undefined" ? window.location.search : ""}`;
 
 				return renderComponent(TaskNameCell, { task: r, url });

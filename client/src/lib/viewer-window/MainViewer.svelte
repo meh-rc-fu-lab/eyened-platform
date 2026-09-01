@@ -31,6 +31,8 @@
 	import PanelInfo from "./panelInfo/panelInfo.svelte";
 	import PanelSegmentation from "./panelSegmentation/PanelSegmentation.svelte";
 	import { FeaturePipetteOverlay } from "./panelSegmentation/FeaturePipetteOverlay";
+	import { EnfaceProjectionManager } from "./enfaceProjectionManager.svelte";
+	import { EnfaceProjectionOverlay } from "$lib/viewer/overlays/EnfaceProjectionOverlay";
 	import EtdrsPanelHelp from "./panelHelp/EtdrsPanelHelp.svelte";
 	import FormPanelHelp from "./panelHelp/FormPanelHelp.svelte";
 	import InfoPanelHelp from "./panelHelp/InfoPanelHelp.svelte";
@@ -72,6 +74,11 @@
 	// activePanels.add("Segmentation");
 
 	const topViewer = viewerWindowContext.topViewers.get(image)!;
+	if (image.is3D) {
+		viewerWindowContext.enfaceProjectionManagers
+			.get(image.instance.id)
+			?.registerMainViewerContext(mainViewerContext);
+	}
 
 	const followCursor = {
 		pointermove(e: ViewerEvent<PointerEvent>) {

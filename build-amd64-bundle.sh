@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 BUNDLE_DIR="bundle"
-BUNDLE_NAME="eyeneed-bundle-amd64.tar"
+BUNDLE_NAME="eyened-bundle-amd64.tar"
 OUTPUT_FILE="$BUNDLE_DIR/$BUNDLE_NAME"
 
 # Determine target platform
@@ -53,18 +53,18 @@ docker image prune -f --filter "dangling=true" 2>/dev/null || true
 
 # Build server image
 echo "  Building server image..."
-docker build --pull --platform "$PLATFORM" -f docker/Dockerfile.server -t eyeneed-bundle-server:latest .
-echo "    ✓ Server image: eyeneed-bundle-server:latest"
+docker build --pull --platform "$PLATFORM" -f docker/Dockerfile.server -t eyened-bundle-server:latest .
+echo "    ✓ Server image: eyened-bundle-server:latest"
 
 # Build client image
 echo "  Building client image..."
-docker build --pull --platform "$PLATFORM" -f docker/Dockerfile.client -t eyeneed-bundle-client:latest .
-echo "    ✓ Client image: eyeneed-bundle-client:latest"
+docker build --pull --platform "$PLATFORM" -f docker/Dockerfile.client -t eyened-bundle-client:latest .
+echo "    ✓ Client image: eyened-bundle-client:latest"
 
 # Build MedSAM image
 echo "  Building MedSAM image..."
-docker build --pull --platform "$PLATFORM" -f docker/Dockerfile.medsam -t eyeneed-bundle-medsam:latest .
-echo "    ✓ MedSAM image: eyeneed-bundle-medsam:latest"
+docker build --pull --platform "$PLATFORM" -f docker/Dockerfile.medsam -t eyened-bundle-medsam:latest .
+echo "    ✓ MedSAM image: eyened-bundle-medsam:latest"
 
 echo ""
 echo "Pulling upstream images..."
@@ -78,9 +78,9 @@ echo "Identifying images to be packaged..."
 
 # List of images to save
 IMAGES_TO_SAVE=(
-    "eyeneed-bundle-server:latest"
-    "eyeneed-bundle-client:latest"
-    "eyeneed-bundle-medsam:latest"
+    "eyened-bundle-server:latest"
+    "eyened-bundle-client:latest"
+    "eyened-bundle-medsam:latest"
     "mysql:8.0.27"
     "redis:7-alpine"
     "nginx:latest"

@@ -13,11 +13,11 @@ from eyened_orm import (
 )
 from ..db import get_db
 from ..utils.db_logging import get_db_logger
-from .auth import CurrentUser, get_current_user, is_admin_user
+from .auth import CurrentUser, get_current_user, is_admin_user, require_admin
 from ..dtos.dtos_tasks import (
     TaskPUT, TaskPATCH, TaskGET,
     SubTasksResponse, SubTasksWithImagesResponse,
-    SubTaskGET, SubTaskWithImagesGET,
+    SubTaskGET, SubTaskPOST, SubTaskWithImagesGET,
 )
 from ..dtos.dto_converter import DTOConverter
 
@@ -84,6 +84,10 @@ def _is_cvi_task_name(task_name: str | None) -> bool:
     if not task_name:
         return False
     return "cvi" in task_name.strip().lower()
+
+
+def _is_sdd_task(task: Task) -> bool:
+    return int(task.TaskID) == 65 or "sdd" in (task.TaskName or "").strip().lower()
 
 
 def _normalize_cvi_status(value: object) -> str:
@@ -163,6 +167,21 @@ def _count_assigned_cvi_rows(db: Session, creator_id: int) -> tuple[int, int]:
     return 0, 0
 
 
+def _count_assigned_sdd_rows(db: Session, creator_id: int) -> tuple[int, int]:
+    try:
+        row = db.execute(
+            text(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN `decision` IS NOT NULL THEN 1 ELSE 0 END) AS ready "
+                "FROM `SDDGradingData` WHERE `grader` = :creator_id"
+            ),
+            {"creator_id": creator_id},
+        ).mappings().first()
+        return int((row or {}).get("total", 0) or 0), int((row or {}).get("ready", 0) or 0)
+    except Exception:
+        return 0, 0
+
+
 @router.post("/task", response_model=TaskGET)
 async def create_task(dto: TaskPUT, db: Session = Depends(get_db), current_user: CurrentUser = Depends(get_current_user)):
     task = Task(
@@ -224,6 +243,7 @@ async def list_tasks(
     task_ids = [t.TaskID for t in rows]
     counts = _subtask_counts_by_task_id_for_user(db, task_ids, current_user.id)
     assigned_cvi_total, assigned_cvi_ready = _count_assigned_cvi_rows(db, current_user.id)
+    assigned_sdd_total, assigned_sdd_ready = _count_assigned_sdd_rows(db, current_user.id)
 
     filtered_rows: list[Task] = []
     for task in rows:
@@ -231,6 +251,9 @@ async def list_tasks(
         if _is_cvi_task_name(task.TaskName):
             assigned_count = assigned_cvi_total
             assigned_ready = assigned_cvi_ready
+        elif _is_sdd_task(task):
+            assigned_count = assigned_sdd_total
+            assigned_ready = assigned_sdd_ready
 
         if assigned_count > 0:
             filtered_rows.append(task)
@@ -241,6 +264,9 @@ async def list_tasks(
         if _is_cvi_task_name(task.TaskName):
             assigned_count = assigned_cvi_total
             assigned_ready = assigned_cvi_ready
+        elif _is_sdd_task(task):
+            assigned_count = assigned_sdd_total
+            assigned_ready = assigned_sdd_ready
         response.append(
             DTOConverter.task_to_get(
                 task,
@@ -356,6 +382,40 @@ async def delete_task(task_id: int, db: Session = Depends(get_db), current_user:
 
 
 
+
+
+@router.post("/task/{task_id}/subtasks", response_model=SubTaskGET)
+async def create_subtask(
+    task_id: int,
+    dto: SubTaskPOST,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(current_user, db)
+    if db.get(Task, task_id) is None:
+        raise HTTPException(404, "Task not found")
+
+    subtask = SubTask(
+        TaskID=task_id,
+        TaskState=SubTaskState.NotStarted,
+        Comments=dto.comments,
+    )
+    db.add(subtask)
+    db.commit()
+    db.refresh(subtask)
+
+    logger = get_db_logger()
+    if logger:
+        logger.log_insert(
+            user=current_user.username,
+            user_id=current_user.id,
+            endpoint=f"POST /api/task/{task_id}/subtasks",
+            entity="SubTask",
+            entity_id=subtask.SubTaskID,
+            fields={"task_id": task_id, "comments": subtask.Comments},
+        )
+
+    return DTOConverter.subtask_to_get(subtask)
 
 
 @router.get(

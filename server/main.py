@@ -26,6 +26,7 @@ from server.routes import (
     studies,
     patients,
     semi_auto_segmentation,
+    sdd,
 )
 from server.utils.db_logging import init_db_logger
 from server.config import get_redis_connection, settings
@@ -48,6 +49,7 @@ app_api.include_router(devices.router)
 app_api.include_router(studies.router)
 app_api.include_router(patients.router)
 app_api.include_router(semi_auto_segmentation.router)
+app_api.include_router(sdd.router)
 
 
 ### Exception handlers
