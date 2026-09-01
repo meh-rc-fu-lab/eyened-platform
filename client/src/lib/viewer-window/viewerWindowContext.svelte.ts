@@ -170,15 +170,19 @@ export class ViewerWindowContext {
                     this.topViewers.set(image, viewerContext);
                 }
 
-                const projectionImage = loadedImages.find((image) =>
-                    image.image_id.endsWith("_proj"),
-                );
-                const octImage = loadedImages.find((image) => image.is3D);
-                if (projectionImage?.is2D && octImage?.is3D) {
-                    this.enfaceProjectionManagers.set(
-                        instance.id,
-                        new EnfaceProjectionManager(octImage as Image3D),
+                try {
+                    const projectionImage = loadedImages.find((image) =>
+                        image.image_id.endsWith("_proj"),
                     );
+                    const octImage = loadedImages.find((image) => image.is3D);
+                    if (projectionImage?.is2D && octImage?.is3D) {
+                        this.enfaceProjectionManagers.set(
+                            instance.id,
+                            new EnfaceProjectionManager(octImage as Image3D),
+                        );
+                    }
+                } catch (error) {
+                    console.error("Failed to initialize enface projection", error);
                 }
 
                 return loadedImages;
