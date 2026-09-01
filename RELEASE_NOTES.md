@@ -1,3 +1,57 @@
+# Unreleased
+
+Changes merged since v2026.08.0. This section is renamed to the version heading when
+the next release is cut.
+
+## Upgrade notes
+
+1. **Run `alembic upgrade head` on your *current* checkout before deploying this
+   release**, then deploy, then run `alembic stamp --purge orm_baseline`
+   (`--purge` is required — the squash drops the pre-cutover id from the
+   revision map). This release squashes the Alembic history to a single
+   baseline revision, so a database left behind head cannot be migrated
+   afterwards — the revisions it still needs (including the one adding
+   `AuditLog`) are no longer on the trail. Deploying first leaves Alembic
+   unable to resolve your current revision. Full procedure:
+   `docs/runbooks/2026-08-20-alembic-squash-cutover.md`.
+
+---
+
+# EyeNED Platform v2026.08.0
+
+This release focuses on viewer persistence and enface overlays, a service-layer cutover with an audit log (groundwork for RBAC), and a rewrite of CFI model inference. Version numbers follow calendar versioning (`YYYY.MM.MICRO`).
+
+## Highlights
+
+- **Viewer bookmarks:** open viewers and B-scan indices persist in the URL (`v=`) and localStorage (#198).
+- **Enface on registered images:** overlays follow GPU registration hops; photolocator hit testing covers raster, radial, and circular locators (#177, #194).
+- **Server service layer:** FastAPI routes go through repositories and services; mutations write an append-only `AuditLog`. This is preparation for RBAC, not a permission-model change for operators (#171 and related PRs).
+- **CFI inference:** `eorm run-cfi-models` replaces the previous CFI writers, with model versions, input specs, and more robust batching (#158).
+- **CI:** client and server test/lint gates on `development` and `main`.
+
+## Bug fixes
+
+**Viewer**
+
+- Large DICOM volumes and IR/OCT stretch (#196).
+- Patient registration on task viewer (#144).
+- CirclePhotoLocator crash (#157).
+- Multiclass erode/dilate (#131).
+- Copy public ID from browser and viewer thumbnails (#140, #143).
+
+**ORM / server**
+
+- PNG series path resolution (#191).
+- CFI inference filtering, thumbnails, lock/deadlock replay (#158).
+- Removed unused `mysql-connector-python` (#199).
+
+### Upgrade notes
+
+1. Run database migrations before starting the new server containers (`AuditLog` table).
+2. Reinstall `eyened_orm` after pulling.
+3. Use `eorm run-cfi-models` instead of the removed legacy CFI writers.
+4. Do not depend on `mysql-connector-python`.
+
 # EyeNED Platform v2026.07.0
 
 Major release: OpenID Connect login, a renewed ORM importer, centralized thumbnail generation, unified `eorm` CLI targeting, registration model versioning, major viewer and segmentation improvements, ETDRS/form-schema tooling, and refreshed deployment documentation.

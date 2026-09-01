@@ -3,6 +3,7 @@ docker/.env
 *.zip
 *.pyc
 notebooks/hrfav/**/*
+notebooks/schema.json
 node_modules/**/*
 extensions.ts
 client/src/lib/extensions.ts
@@ -12,16 +13,13 @@ dev/docker-compose.yml
 cookies.txt
 .vscode/settings.json
 client/package-lock.json
-client/src/lib/extensions.ts
 TODO.md
 orm/migrations/transfer-config.yml
 orm/migrations/transfer-config.*.yml
 segmentations.zarr/
 **/.ipynb_checkpoints/**
 .cursor/
-client/src/lib/extensions.ts
 venv
-<<<<<<< Updated upstream
 trash
 scratch.txt
 dev/.venv
@@ -34,6 +32,10 @@ graphify-out/
 .superpowers/
 CLAUDE.md
 docs/superpowers/
+
+# Agent / superpowers working docs (local only)
+.agents/
+
 .coverage
 coverage.xml
 htmlcov/
@@ -41,14 +43,8 @@ client/coverage/
 # diff-cover writes its markdown report to the cwd, not into coverage/.
 diff-cover.md
 client/diff-cover-client.md
-=======
 trashMedSAM/*.pth
 MedSAM/*.pth
-MedSAM/*.pth
-*.pth
-.local/
-MedSAM/Medical-SAM2-main/
->>>>>>> Stashed changes
 *.pth
 .local/
 MedSAM/Medical-SAM2-main/

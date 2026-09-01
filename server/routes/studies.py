@@ -13,7 +13,7 @@ router = APIRouter()
 
 
 @router.post("/studies/{study_id}/tags", response_model=TagMeta)
-async def tag_study(
+def tag_study(
     study_id: int,
     body: ObjectTagPOST,
     db: Session = Depends(get_db),
@@ -79,7 +79,7 @@ async def tag_study(
 
 
 @router.delete("/studies/{study_id}/tags/{tag_id}", status_code=204)
-async def untag_study(
+def untag_study(
     study_id: int,
     tag_id: int,
     db: Session = Depends(get_db),
@@ -118,7 +118,7 @@ async def untag_study(
 
 
 @router.patch("/studies/{study_id}/tags/{tag_id}", response_model=TagMeta)
-async def patch_study_tag(
+def patch_study_tag(
     study_id: int,
     tag_id: int,
     body: ObjectTagPATCH,
