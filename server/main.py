@@ -1,5 +1,4 @@
 import logging
-import sys
 import traceback
 from contextlib import asynccontextmanager
 
@@ -12,6 +11,8 @@ from sqlalchemy.exc import SQLAlchemyError, TimeoutError as PoolTimeoutError
 
 from server.routes import (
     auth,
+    cvi,
+    management,
     import_api,
     instances,
     segmentations,
@@ -25,14 +26,18 @@ from server.routes import (
     devices,
     studies,
     patients,
+    semi_auto_segmentation,
+    sdd,
 )
+from server.utils.db_logging import init_db_logger
 from server.config import get_redis_connection, settings
-from server.services.exceptions import register_exception_handlers
 
 logger = logging.getLogger(__name__)
 
 app_api = FastAPI(title="Eyened API")
 app_api.include_router(auth.router)
+app_api.include_router(cvi.router)
+app_api.include_router(management.router)
 app_api.include_router(instances.router)
 app_api.include_router(segmentations.router)
 app_api.include_router(import_api.router)
@@ -46,8 +51,8 @@ app_api.include_router(subtask.router)
 app_api.include_router(devices.router)
 app_api.include_router(studies.router)
 app_api.include_router(patients.router)
-
-register_exception_handlers(app_api)
+app_api.include_router(semi_auto_segmentation.router)
+app_api.include_router(sdd.router)
 
 
 ### Exception handlers
@@ -97,24 +102,6 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 
-def configure_audit_logging() -> None:
-    """Route the eyened.audit logger to stdout as JSON, isolated from app logs.
-
-    Compliance is never debug-gated: audit is always INFO. App/debug logs stay on
-    stderr via logging.basicConfig().
-    """
-    audit = logging.getLogger("eyened.audit")
-    audit.setLevel(settings.db_log.level)
-    audit.propagate = False
-    if not any(
-        isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout
-        for h in audit.handlers
-    ):
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        audit.addHandler(handler)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Starting up with settings:")
@@ -132,8 +119,8 @@ async def lifespan(app: FastAPI):
         logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
         logging.getLogger("server").setLevel(logging.INFO)
 
-    # Audit events go to stdout as JSON; app/debug logs stay on stderr.
-    configure_audit_logging()
+    # Initialize database modification logger
+    init_db_logger(settings)
 
     # Sync handlers run here. anyio's default is 40, which would outnumber the
     # connection pool; Settings validates the two against each other, and this
